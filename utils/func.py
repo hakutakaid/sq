@@ -6,7 +6,7 @@ import cv2
 import logging
 import asyncio
 import asyncpg
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone # <--- Import timezone
 import json
 
 # Import DATABASE_URL from config.py
@@ -37,7 +37,7 @@ class DatabaseManager:
             self._pool = None
             logger.info("Database connection pool closed.")
 
-    async def _execute(self, query, *params): # Changed params to *params for direct unpacking
+    async def _execute(self, query, *params):
         async with self._pool.acquire() as conn:
             try:
                 await conn.execute(query, *params)
@@ -45,7 +45,7 @@ class DatabaseManager:
                 logger.error(f"Error executing query: {query} with params {params} - {e}")
                 raise
 
-    async def _fetchrow(self, query, *params): # Changed params to *params
+    async def _fetchrow(self, query, *params):
         async with self._pool.acquire() as conn:
             try:
                 return await conn.fetchrow(query, *params)
@@ -53,7 +53,7 @@ class DatabaseManager:
                 logger.error(f"Error fetching one row: {query} with params {params} - {e}")
                 raise
 
-    async def _fetch(self, query, *params): # Changed params to *params
+    async def _fetch(self, query, *params):
         async with self._pool.acquire() as conn:
             try:
                 return await conn.fetch(query, *params)
@@ -129,19 +129,18 @@ class UsersCollection:
         set_fields = update_query.get("$set", {})
         unset_fields = update_query.get("$unset", {})
 
+        # Ensure updated_at is timezone-aware UTC
         if "updated_at" not in set_fields:
-            set_fields["updated_at"] = datetime.now() # Always update timestamp
+            set_fields["updated_at"] = datetime.now(timezone.utc)
 
         if upsert:
-            # Use INSERT ... ON CONFLICT (user_id) DO UPDATE
             insert_columns = ["user_id"]
             insert_placeholders = ["$1"]
             insert_values = [user_id]
             
             update_on_conflict_parts = []
-            param_index = 2 # Start from $2 for SET fields in ON CONFLICT
+            param_index = 2
             
-            # Add set fields to both insert and update parts
             for k, v in set_fields.items():
                 insert_columns.append(k)
                 insert_placeholders.append(f"${param_index}")
@@ -149,7 +148,6 @@ class UsersCollection:
                 update_on_conflict_parts.append(f"{k} = EXCLUDED.{k}")
                 param_index += 1
 
-            # Add unset fields to update part (setting to NULL)
             for k in unset_fields:
                 update_on_conflict_parts.append(f"{k} = NULL")
 
@@ -157,11 +155,10 @@ class UsersCollection:
             if update_on_conflict_parts:
                 insert_sql += f" ON CONFLICT (user_id) DO UPDATE SET {', '.join(update_on_conflict_parts)}"
             else:
-                insert_sql += " ON CONFLICT (user_id) DO NOTHING" # If no update fields, just do nothing
+                insert_sql += " ON CONFLICT (user_id) DO NOTHING"
 
-            await self.db_manager._execute(insert_sql, *insert_values) # Unpack values
+            await self.db_manager._execute(insert_sql, *insert_values)
         else:
-            # Standard UPDATE
             set_clauses = []
             set_values = []
             param_index = 1
@@ -197,7 +194,7 @@ class UsersCollection:
 
         row = await self.db_manager._fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
         if row:
-            data = dict(row) # asyncpg.Record can be directly converted to dict
+            data = dict(row)
             data['replacement_words'] = data.get('replacement_words') or {}
             data['delete_words'] = data.get('delete_words') or []
             return data
@@ -215,24 +212,23 @@ class PremiumUsersCollection:
 
         set_fields = update_query.get("$set", {})
 
-        # Ensure datetime objects are used directly for TIMESTAMPTZ
-        # This conversion logic should be robust if string dates are passed from other places
-        if "subscription_start" in set_fields and isinstance(set_fields["subscription_start"], str):
-            set_fields["subscription_start"] = datetime.fromisoformat(set_fields["subscription_start"])
-        if "subscription_end" in set_fields and isinstance(set_fields["subscription_end"], str):
-            set_fields["subscription_end"] = datetime.fromisoformat(set_fields["subscription_end"])
+        # Ensure datetime objects are timezone-aware UTC when stored
+        for field in ["subscription_start", "subscription_end"]:
+            if field in set_fields and isinstance(set_fields[field], datetime):
+                # Ensure it's UTC-aware. If naive, assume UTC.
+                if set_fields[field].tzinfo is None:
+                    set_fields[field] = set_fields[field].replace(tzinfo=timezone.utc)
+                else: # Convert to UTC if it's aware but not UTC
+                    set_fields[field] = set_fields[field].astimezone(timezone.utc)
 
-        # Prepare columns and values for INSERT and UPDATE.
-        # Ensure user_id is not duplicated in the SET clause of ON CONFLICT.
 
         if upsert:
-            # For upsert, we build the INSERT ... ON CONFLICT statement
             insert_columns = ["user_id"]
             insert_placeholders = ["$1"]
             insert_values = [user_id]
             
-            update_set_clauses = [] # Clauses for the DO UPDATE SET part
-            param_index_for_insert = 2 # Starting from $2 for values after user_id
+            update_set_clauses = []
+            param_index_for_insert = 2
 
             for k, v in set_fields.items():
                 insert_columns.append(k)
@@ -246,15 +242,14 @@ class PremiumUsersCollection:
             if update_set_clauses:
                 insert_sql += f" ON CONFLICT (user_id) DO UPDATE SET {', '.join(update_set_clauses)}"
             else:
-                insert_sql += " ON CONFLICT (user_id) DO NOTHING" # If only user_id is provided and no other fields to set on update
+                insert_sql += " ON CONFLICT (user_id) DO NOTHING"
 
-            await self.db_manager._execute(insert_sql, *insert_values) # Unpack values
+            await self.db_manager._execute(insert_sql, *insert_values)
 
         else:
-            # For non-upsert (standard UPDATE)
             set_clauses = []
             set_values = []
-            param_index = 1 # Starting from $1 for the SET values
+            param_index = 1
 
             for k, v in set_fields.items():
                 set_clauses.append(f"{k} = ${param_index}")
@@ -266,7 +261,7 @@ class PremiumUsersCollection:
                 return
 
             query = f"UPDATE premium_users SET {', '.join(set_clauses)} WHERE user_id = ${param_index}"
-            await self.db_manager._execute(query, *(set_values + [user_id])) # Unpack values
+            await self.db_manager._execute(query, *(set_values + [user_id]))
 
 
     async def find_one(self, filter_query):
@@ -276,7 +271,8 @@ class PremiumUsersCollection:
 
         row = await self.db_manager._fetchrow("SELECT * FROM premium_users WHERE user_id = $1", user_id)
         if row:
-            return dict(row) # asyncpg.Record can be directly converted to dict
+            # asyncpg returns timezone-aware datetime objects for TIMESTAMPTZ columns
+            return dict(row)
         return None
 
     async def create_index(self, field_name, expireAfterSeconds=None):
@@ -292,9 +288,16 @@ class StatisticsCollection:
         self.db_manager = db_manager
 
     async def insert_one(self, document):
+        # Ensure timestamp is timezone-aware UTC
+        timestamp = document.get('timestamp', datetime.now(timezone.utc))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        else:
+            timestamp = timestamp.astimezone(timezone.utc)
+
         await self.db_manager._execute(
             "INSERT INTO statistics (event_type, timestamp, user_id) VALUES ($1, $2, $3)",
-            document.get('event_type'), document.get('timestamp'), document.get('user_id')
+            document.get('event_type'), timestamp, document.get('user_id')
         )
 
     async def count_documents(self, filter_query={}):
@@ -369,10 +372,17 @@ class RedeemCodeCollection:
         return None
 
     async def insert_one(self, document):
+        # Ensure used_at is timezone-aware UTC
+        used_at = document.get('used_at')
+        if used_at and used_at.tzinfo is None:
+            used_at = used_at.replace(tzinfo=timezone.utc)
+        elif used_at:
+            used_at = used_at.astimezone(timezone.utc)
+
         await self.db_manager._execute(
             "INSERT INTO redeem_code (code, duration_value, duration_unit, used_by, used_at) VALUES ($1, $2, $3, $4, $5)",
             document.get('code'), document.get('duration_value'), document.get('duration_unit'),
-            document.get('used_by'), document.get('used_at')
+            document.get('used_by'), used_at
         )
 
     async def update_one(self, filter_query, update_query):
@@ -382,9 +392,12 @@ class RedeemCodeCollection:
 
         set_fields = update_query.get("$set", {})
 
-        # Ensure datetime objects are used directly for TIMESTAMPTZ
-        if "used_at" in set_fields and isinstance(set_fields["used_at"], str):
-            set_fields["used_at"] = datetime.fromisoformat(set_fields["used_at"])
+        # Ensure used_at is timezone-aware UTC when updated
+        if "used_at" in set_fields and isinstance(set_fields["used_at"], datetime):
+            if set_fields["used_at"].tzinfo is None:
+                set_fields["used_at"] = set_fields["used_at"].replace(tzinfo=timezone.utc)
+            else:
+                set_fields["used_at"] = set_fields["used_at"].astimezone(timezone.utc)
 
         set_clauses = []
         set_values = []
@@ -399,7 +412,7 @@ class RedeemCodeCollection:
             return
 
         query = f"UPDATE redeem_code SET {', '.join(set_clauses)} WHERE code = ${param_index}"
-        await self.db_manager._execute(query, *(set_values + [code])) # Unpack values
+        await self.db_manager._execute(query, *(set_values + [code]))
 
     async def delete_one(self, filter_query):
         code = filter_query.get("code")
@@ -443,6 +456,9 @@ def is_private_link(link):
 
 
 def thumbnail(sender):
+    # This should likely create a unique filename per screenshot if multiple are taken
+    # or rely on a user-specific custom thumbnail setup.
+    # If used for temporary screenshots during download, consider using tempfile module.
     return f'{sender}.jpg' if os.path.exists(f'{sender}.jpg') else None
 
 
@@ -492,8 +508,6 @@ def get_dummy_filename(info):
 
 
 async def is_private_chat(event):
-    # This function is used by Telethon client.event handlers.
-    # Telethon's event.is_private is a direct property.
     return event.is_private
 
 
@@ -525,7 +539,7 @@ async def save_user_session(user_id, session_string):
             {"user_id": user_id},
             {"$set": {
                 "session_string": session_string,
-                "updated_at": datetime.now() # asyncpg handles datetime objects directly
+                "updated_at": datetime.now(timezone.utc) # Ensure UTC
             }},
             upsert=True
         )
@@ -555,7 +569,7 @@ async def save_user_bot(user_id, bot_token):
             {"user_id": user_id},
             {"$set": {
                 "bot_token": bot_token,
-                "updated_at": datetime.now() # asyncpg handles datetime objects directly
+                "updated_at": datetime.now(timezone.utc) # Ensure UTC
             }},
             upsert=True
         )
@@ -589,12 +603,18 @@ async def process_text_with_rules(user_id, text):
 
         processed_text = text
         for word, replacement in replacements.items():
-            processed_text = processed_text.replace(word, replacement)
+            # Use re.sub with word boundaries to replace whole words only
+            processed_text = re.sub(r'\b' + re.escape(word) + r'\b', replacement, processed_text, flags=re.IGNORECASE)
 
         if delete_words:
-            words = processed_text.split()
-            filtered_words = [w for w in words if w not in delete_words]
-            processed_text = " ".join(filtered_words)
+            # Create a regex pattern to delete multiple words efficiently
+            # Escaping words ensures special characters are treated literally
+            # \b for word boundaries
+            delete_pattern = r'\b(?:' + '|'.join(re.escape(w) for w in delete_words) + r')\b'
+            processed_text = re.sub(delete_pattern, '', processed_text, flags=re.IGNORECASE).strip()
+            # Remove extra spaces left by deletion
+            processed_text = re.sub(r'\s+', ' ', processed_text).strip()
+
 
         return processed_text
     except Exception as e:
@@ -603,12 +623,10 @@ async def process_text_with_rules(user_id, text):
 
 
 async def screenshot(video: str, duration: int, sender: str) -> str | None:
-    # This ensures a unique name for each screenshot attempt
     output_file = f"{sender}_{int(time.time())}.jpg"
 
     time_stamp = hhmmss(duration // 2)
     
-
     cmd = [
         "ffmpeg",
         "-ss", time_stamp,
@@ -660,19 +678,20 @@ async def get_video_metadata(file_path):
                 vcap.release()
                 return {'width': width, 'height': height, 'duration': duration}
             except Exception as e:
-                logger.error(f"Error in video_metadata: {e}")
+                logger.error(f"Error in _extract_metadata (cv2): {e}")
                 return default_values
 
         return await loop.run_in_executor(executor, _extract_metadata)
 
     except Exception as e:
-        logger.error(f"Error in get_video_metadata: {e}")
+        logger.error(f"Error in get_video_metadata overall: {e}")
         return default_values
 
 
 async def add_premium_user(user_id, duration_value, duration_unit):
     try:
-        now = datetime.now()
+        # Always use UTC for consistency
+        now = datetime.now(timezone.utc)
         expiry_date = None
 
         if duration_unit == "min":
@@ -692,16 +711,14 @@ async def add_premium_user(user_id, duration_value, duration_unit):
         else:
             return False, "Invalid duration unit"
 
-        # Do NOT include 'user_id' in the $set dictionary when calling update_one
-        # The user_id is already in the filter_query and handled by ON CONFLICT
         update_fields = {
-            "subscription_start": now, # Pass datetime object directly
-            "subscription_end": expiry_date, # Pass datetime object directly
+            "subscription_start": now,
+            "subscription_end": expiry_date,
         }
 
         await premium_users_collection.update_one(
-            {"user_id": user_id}, # Filter query for the user
-            {"$set": update_fields}, # Only update fields here
+            {"user_id": user_id},
+            {"$set": update_fields},
             upsert=True
         )
 
@@ -714,9 +731,9 @@ async def add_premium_user(user_id, duration_value, duration_unit):
 async def is_premium_user(user_id):
     try:
         user = await premium_users_collection.find_one({"user_id": user_id})
-        if user and "subscription_end" in user:
-            subscription_end = user["subscription_end"]
-            now = datetime.now()
+        if user and "subscription_end" in user and user["subscription_end"] is not None:
+            subscription_end = user["subscription_end"] # This will be timezone-aware from DB
+            now = datetime.now(timezone.utc) # <--- Make 'now' timezone-aware UTC
             return now < subscription_end
         return False
     except Exception as e:
