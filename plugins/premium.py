@@ -24,9 +24,19 @@ async def add_premium_handler(event):
         return
     """Handle /add command to add premium users (owner only)"""
     user_id = event.sender_id
-    if user_id not in OWNER_ID:
-        await event.respond('This command is restricted to the bot owner.')
+    # OWNER_ID can be a single int or a list/tuple of ints
+    if isinstance(OWNER_ID, (list, tuple)):
+        if user_id not in OWNER_ID:
+            await event.respond('This command is restricted to the bot owner.')
+            return
+    elif isinstance(OWNER_ID, int):
+        if user_id != OWNER_ID:
+            await event.respond('This command is restricted to the bot owner.')
+            return
+    else:
+        await event.respond('Bot owner ID not configured correctly.')
         return
+
     text = event.message.text.strip()
     parts = text.split(' ')
     if len(parts) != 4:
@@ -50,16 +60,22 @@ Example: /add 123456 1 week"""
             duration_value, duration_unit)
         if success:
             expiry_utc = result
+            # Calculate IST (UTC + 5 hours 30 minutes)
             expiry_ist = expiry_utc + timedelta(hours=5, minutes=30)
             formatted_expiry = expiry_ist.strftime('%d-%b-%Y %I:%M:%S %p')
             await event.respond(
                 f"""✅ User {target_user_id} added as premium member
 Subscription valid until: {formatted_expiry} (IST)"""
                 )
-            await bot_client.send_message(target_user_id,
-                f"""✅ Your have been added as premium member
+            # Try to notify the target user, but don't fail if it's blocked
+            try:
+                await bot_client.send_message(target_user_id,
+                    f"""✅ Your have been added as premium member
 **Validity upto**: {formatted_expiry} (IST)"""
-                )
+                    )
+            except Exception as notify_e:
+                print(f"Could not notify user {target_user_id}: {notify_e}")
+                await event.respond(f"User {target_user_id} added, but could not be notified (might have blocked the bot).")
         else:
             await event.respond(f'❌ Failed to add premium user: {result}')
     except ValueError:
@@ -103,3 +119,15 @@ async def start_handler(client, message):
         caption=b6,
         reply_markup=kb
     )
+
+# --- Add this function to resolve the plugin warning ---
+async def run_premium_plugin():
+    """
+    This function serves as the entry point for the 'premium' plugin,
+    called by main.py on startup.
+    Add any premium-specific startup logic here if needed.
+    """
+    print("Premium plugin initialized.")
+    # No specific startup tasks needed for this plugin based on current code,
+    # as its functionality is entirely event-driven (Telethon and Pyrogram handlers).
+    pass

@@ -5,9 +5,12 @@ import re
 import cv2
 import logging
 import asyncio
-import asyncpg # <--- Changed from aiosqlite
+import asyncpg
 from datetime import datetime, timedelta
 import json
+
+# Import DATABASE_URL from config.py
+from config import DATABASE_URL
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,10 +19,6 @@ PUBLIC_LINK_PATTERN = re.compile(r'(https?://)?(t\.me|telegram\.me)/([^/]+)(/(\d
 PRIVATE_LINK_PATTERN = re.compile(r'(https?://)?(t\.me|telegram\.me)/c/(\d+)(/(\d+))?')
 VIDEO_EXTENSIONS = {"mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "mpeg", "mpg", "3gp"}
 
-# PostgreSQL connection string
-# !!! PENTING: GANTI DENGAN CONNECTION STRING NEON ANDA YANG ASLI !!!
-# Pastikan Anda tidak mengekspos ini di repositori publik. Gunakan variabel lingkungan jika memungkinkan.
-DATABASE_URL = 'postgresql://neondb_owner:npg_KWycurJR4b6G@ep-falling-resonance-a1xeqesc-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require'
 
 class DatabaseManager:
     def __init__(self, db_url):
@@ -36,40 +35,33 @@ class DatabaseManager:
         if self._pool:
             await self._pool.close()
             self._pool = None
+            logger.info("Database connection pool closed.")
 
-    async def _execute(self, query, params=()):
+    async def _execute(self, query, *params): # Changed params to *params for direct unpacking
         async with self._pool.acquire() as conn:
             try:
-                # Use execute for DDL and DML operations that don't return rows
-                # asyncpg uses $1, $2, ... for parameters
                 await conn.execute(query, *params)
             except Exception as e:
                 logger.error(f"Error executing query: {query} with params {params} - {e}")
                 raise
 
-    async def _fetchrow(self, query, params=()):
+    async def _fetchrow(self, query, *params): # Changed params to *params
         async with self._pool.acquire() as conn:
             try:
-                # Use fetchrow for single row results
                 return await conn.fetchrow(query, *params)
             except Exception as e:
                 logger.error(f"Error fetching one row: {query} with params {params} - {e}")
                 raise
 
-    async def _fetch(self, query, params=()):
+    async def _fetch(self, query, *params): # Changed params to *params
         async with self._pool.acquire() as conn:
             try:
-                # Use fetch for multiple row results
                 return await conn.fetch(query, *params)
             except Exception as e:
                 logger.error(f"Error fetching all rows: {query} with params {params} - {e}")
                 raise
 
     async def _create_tables(self):
-        # Using BIGINT for user_id (Telegram IDs can be large)
-        # BIGSERIAL for auto-incrementing primary keys
-        # JSONB for JSON data for better performance and querying
-        # TIMESTAMPTZ for timezone-aware timestamps
         await self._execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -122,6 +114,7 @@ class DatabaseManager:
     async def get_codedb_collection(self):
         return RedeemCodeCollection(self)
 
+# Initialize db_manager with the DATABASE_URL from config.py
 db_manager = DatabaseManager(DATABASE_URL)
 
 class UsersCollection:
@@ -136,23 +129,54 @@ class UsersCollection:
         set_fields = update_query.get("$set", {})
         unset_fields = update_query.get("$unset", {})
 
-        # asyncpg handles datetime objects directly for TIMESTAMPTZ
-        # JSONB fields handle dict/list directly, no need for json.dumps/loads
         if "updated_at" not in set_fields:
             set_fields["updated_at"] = datetime.now() # Always update timestamp
 
-        set_clauses = []
-        set_values = []
-        param_index = 1
+        if upsert:
+            # Use INSERT ... ON CONFLICT (user_id) DO UPDATE
+            insert_columns = ["user_id"]
+            insert_placeholders = ["$1"]
+            insert_values = [user_id]
+            
+            update_on_conflict_parts = []
+            param_index = 2 # Start from $2 for SET fields in ON CONFLICT
+            
+            # Add set fields to both insert and update parts
+            for k, v in set_fields.items():
+                insert_columns.append(k)
+                insert_placeholders.append(f"${param_index}")
+                insert_values.append(v)
+                update_on_conflict_parts.append(f"{k} = EXCLUDED.{k}")
+                param_index += 1
 
-        for k, v in set_fields.items():
-            set_clauses.append(f"{k} = ${param_index}")
-            set_values.append(v)
-            param_index += 1
+            # Add unset fields to update part (setting to NULL)
+            for k in unset_fields:
+                update_on_conflict_parts.append(f"{k} = NULL")
 
-        unset_clauses = [f"{k} = NULL" for k in unset_fields]
+            insert_sql = f"INSERT INTO users ({', '.join(insert_columns)}) VALUES ({', '.join(insert_placeholders)})"
+            if update_on_conflict_parts:
+                insert_sql += f" ON CONFLICT (user_id) DO UPDATE SET {', '.join(update_on_conflict_parts)}"
+            else:
+                insert_sql += " ON CONFLICT (user_id) DO NOTHING" # If no update fields, just do nothing
 
-        if set_clauses or unset_clauses:
+            await self.db_manager._execute(insert_sql, *insert_values) # Unpack values
+        else:
+            # Standard UPDATE
+            set_clauses = []
+            set_values = []
+            param_index = 1
+
+            for k, v in set_fields.items():
+                set_clauses.append(f"{k} = ${param_index}")
+                set_values.append(v)
+                param_index += 1
+
+            unset_clauses = [f"{k} = NULL" for k in unset_fields]
+
+            if not set_clauses and not unset_clauses:
+                logger.debug(f"No fields to update for user {user_id}.")
+                return
+
             update_parts = []
             if set_clauses:
                 update_parts.append(", ".join(set_clauses))
@@ -160,54 +184,20 @@ class UsersCollection:
                 update_parts.append(", ".join(unset_clauses))
 
             update_sql_set_part = ", ".join(update_parts)
+            
+            query = f"UPDATE users SET {update_sql_set_part} WHERE user_id = ${param_index}"
+            values = set_values + [user_id]
+            await self.db_manager._execute(query, *values)
 
-            existing_user = await self.db_manager._fetchrow("SELECT 1 FROM users WHERE user_id = $1", (user_id,))
-
-            if existing_user:
-                query = f"UPDATE users SET {update_sql_set_part} WHERE user_id = ${param_index}"
-                values = set_values + [user_id]
-                await self.db_manager._execute(query, values)
-            elif upsert:
-                # Use INSERT ... ON CONFLICT (user_id) DO UPDATE
-                columns_to_insert = ["user_id"]
-                placeholders_to_insert = ["$1"]
-                values_to_insert = [user_id]
-
-                update_on_conflict_parts = []
-                current_param_idx_for_insert = 2 # Start from $2 for SET fields in ON CONFLICT
-
-                for k, v in set_fields.items():
-                    columns_to_insert.append(k)
-                    placeholders_to_insert.append(f"${current_param_idx_for_insert}")
-                    values_to_insert.append(v)
-                    update_on_conflict_parts.append(f"{k} = EXCLUDED.{k}")
-                    current_param_idx_for_insert += 1
-
-                for k in unset_fields:
-                    update_on_conflict_parts.append(f"{k} = NULL")
-
-                insert_sql = f"INSERT INTO users ({', '.join(columns_to_insert)}) VALUES ({', '.join(placeholders_to_insert)})"
-                if update_on_conflict_parts:
-                    insert_sql += f" ON CONFLICT (user_id) DO UPDATE SET {', '.join(update_on_conflict_parts)}"
-                else:
-                    insert_sql += " ON CONFLICT (user_id) DO NOTHING" # If no update fields, just do nothing
-
-                await self.db_manager._execute(insert_sql, values_to_insert)
-            else:
-                logger.warning(f"User {user_id} not found and upsert is false.")
-        else:
-            logger.debug(f"No fields to update for user {user_id}.")
 
     async def find_one(self, filter_query):
         user_id = filter_query.get("user_id")
         if not user_id:
             return None
 
-        row = await self.db_manager._fetchrow("SELECT * FROM users WHERE user_id = $1", (user_id,))
+        row = await self.db_manager._fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
         if row:
             data = dict(row) # asyncpg.Record can be directly converted to dict
-            # JSONB fields are automatically loaded as dict/list by asyncpg
-            # Provide default empty dict/list if the column is NULL in DB
             data['replacement_words'] = data.get('replacement_words') or {}
             data['delete_words'] = data.get('delete_words') or []
             return data
@@ -226,48 +216,65 @@ class PremiumUsersCollection:
         set_fields = update_query.get("$set", {})
 
         # Ensure datetime objects are used directly for TIMESTAMPTZ
+        # This conversion logic should be robust if string dates are passed from other places
         if "subscription_start" in set_fields and isinstance(set_fields["subscription_start"], str):
             set_fields["subscription_start"] = datetime.fromisoformat(set_fields["subscription_start"])
         if "subscription_end" in set_fields and isinstance(set_fields["subscription_end"], str):
             set_fields["subscription_end"] = datetime.fromisoformat(set_fields["subscription_end"])
 
-        set_clauses = []
-        set_values = []
-        param_index = 1
+        # Prepare columns and values for INSERT and UPDATE.
+        # Ensure user_id is not duplicated in the SET clause of ON CONFLICT.
 
-        for k, v in set_fields.items():
-            set_clauses.append(f"{k} = ${param_index}")
-            set_values.append(v)
-            param_index += 1
-
-        existing_user = await self.db_manager._fetchrow("SELECT 1 FROM premium_users WHERE user_id = $1", (user_id,))
-
-        if existing_user:
-            query = f"UPDATE premium_users SET {', '.join(set_clauses)} WHERE user_id = ${param_index}"
-            await self.db_manager._execute(query, set_values + [user_id])
-        elif upsert:
-            columns = ["user_id"]
-            placeholders = ["$1"]
+        if upsert:
+            # For upsert, we build the INSERT ... ON CONFLICT statement
+            insert_columns = ["user_id"]
+            insert_placeholders = ["$1"]
             insert_values = [user_id]
+            
+            update_set_clauses = [] # Clauses for the DO UPDATE SET part
+            param_index_for_insert = 2 # Starting from $2 for values after user_id
 
-            current_param_idx = 2
             for k, v in set_fields.items():
-                columns.append(k)
-                placeholders.append(f"${current_param_idx}")
+                insert_columns.append(k)
+                insert_placeholders.append(f"${param_index_for_insert}")
                 insert_values.append(v)
-                current_param_idx += 1
+                update_set_clauses.append(f"{k} = EXCLUDED.{k}")
+                param_index_for_insert += 1
 
-            insert_sql = f"INSERT INTO premium_users ({', '.join(columns)}) VALUES ({', '.join(placeholders)}) ON CONFLICT (user_id) DO UPDATE SET {', '.join([f'{col} = EXCLUDED.{col}' for col in set_fields.keys()])}"
-            await self.db_manager._execute(insert_sql, insert_values)
+            insert_sql = f"INSERT INTO premium_users ({', '.join(insert_columns)}) VALUES ({', '.join(insert_placeholders)})"
+            
+            if update_set_clauses:
+                insert_sql += f" ON CONFLICT (user_id) DO UPDATE SET {', '.join(update_set_clauses)}"
+            else:
+                insert_sql += " ON CONFLICT (user_id) DO NOTHING" # If only user_id is provided and no other fields to set on update
+
+            await self.db_manager._execute(insert_sql, *insert_values) # Unpack values
+
         else:
-            logger.warning(f"Premium user {user_id} not found and upsert is false.")
+            # For non-upsert (standard UPDATE)
+            set_clauses = []
+            set_values = []
+            param_index = 1 # Starting from $1 for the SET values
+
+            for k, v in set_fields.items():
+                set_clauses.append(f"{k} = ${param_index}")
+                set_values.append(v)
+                param_index += 1
+
+            if not set_clauses:
+                logger.warning(f"No fields to update for premium user {user_id}.")
+                return
+
+            query = f"UPDATE premium_users SET {', '.join(set_clauses)} WHERE user_id = ${param_index}"
+            await self.db_manager._execute(query, *(set_values + [user_id])) # Unpack values
+
 
     async def find_one(self, filter_query):
         user_id = filter_query.get("user_id")
         if not user_id:
             return None
 
-        row = await self.db_manager._fetchrow("SELECT * FROM premium_users WHERE user_id = $1", (user_id,))
+        row = await self.db_manager._fetchrow("SELECT * FROM premium_users WHERE user_id = $1", user_id)
         if row:
             return dict(row) # asyncpg.Record can be directly converted to dict
         return None
@@ -287,7 +294,7 @@ class StatisticsCollection:
     async def insert_one(self, document):
         await self.db_manager._execute(
             "INSERT INTO statistics (event_type, timestamp, user_id) VALUES ($1, $2, $3)",
-            (document.get('event_type'), document.get('timestamp'), document.get('user_id'))
+            document.get('event_type'), document.get('timestamp'), document.get('user_id')
         )
 
     async def count_documents(self, filter_query={}):
@@ -356,7 +363,7 @@ class RedeemCodeCollection:
         code = filter_query.get("code")
         if not code:
             return None
-        row = await self.db_manager._fetchrow("SELECT * FROM redeem_code WHERE code = $1", (code,))
+        row = await self.db_manager._fetchrow("SELECT * FROM redeem_code WHERE code = $1", code)
         if row:
             return dict(row)
         return None
@@ -364,8 +371,8 @@ class RedeemCodeCollection:
     async def insert_one(self, document):
         await self.db_manager._execute(
             "INSERT INTO redeem_code (code, duration_value, duration_unit, used_by, used_at) VALUES ($1, $2, $3, $4, $5)",
-            (document.get('code'), document.get('duration_value'), document.get('duration_unit'),
-             document.get('used_by'), document.get('used_at'))
+            document.get('code'), document.get('duration_value'), document.get('duration_unit'),
+            document.get('used_by'), document.get('used_at')
         )
 
     async def update_one(self, filter_query, update_query):
@@ -387,14 +394,18 @@ class RedeemCodeCollection:
             set_values.append(v)
             param_index += 1
 
+        if not set_clauses:
+            logger.warning(f"No fields to update for redeem code {code}.")
+            return
+
         query = f"UPDATE redeem_code SET {', '.join(set_clauses)} WHERE code = ${param_index}"
-        await self.db_manager._execute(query, set_values + [code])
+        await self.db_manager._execute(query, *(set_values + [code])) # Unpack values
 
     async def delete_one(self, filter_query):
         code = filter_query.get("code")
         if not code:
             raise ValueError("code is required for delete_one in redeem_code collection.")
-        await self.db_manager._execute("DELETE FROM redeem_code WHERE code = $1", (code,))
+        await self.db_manager._execute("DELETE FROM redeem_code WHERE code = $1", code)
 
 users_collection = None
 premium_users_collection = None
@@ -481,6 +492,8 @@ def get_dummy_filename(info):
 
 
 async def is_private_chat(event):
+    # This function is used by Telethon client.event handlers.
+    # Telethon's event.is_private is a direct property.
     return event.is_private
 
 
@@ -590,12 +603,11 @@ async def process_text_with_rules(user_id, text):
 
 
 async def screenshot(video: str, duration: int, sender: str) -> str | None:
-    existing_screenshot = f"{sender}.jpg"
-    if os.path.exists(existing_screenshot):
-        return existing_screenshot
+    # This ensures a unique name for each screenshot attempt
+    output_file = f"{sender}_{int(time.time())}.jpg"
 
     time_stamp = hhmmss(duration // 2)
-    output_file = datetime.now().isoformat("_", "seconds") + ".jpg"
+    
 
     cmd = [
         "ffmpeg",
@@ -680,13 +692,16 @@ async def add_premium_user(user_id, duration_value, duration_unit):
         else:
             return False, "Invalid duration unit"
 
+        # Do NOT include 'user_id' in the $set dictionary when calling update_one
+        # The user_id is already in the filter_query and handled by ON CONFLICT
+        update_fields = {
+            "subscription_start": now, # Pass datetime object directly
+            "subscription_end": expiry_date, # Pass datetime object directly
+        }
+
         await premium_users_collection.update_one(
-            {"user_id": user_id},
-            {"$set": {
-                "user_id": user_id,
-                "subscription_start": now, # Pass datetime object directly
-                "subscription_end": expiry_date, # Pass datetime object directly
-            }},
+            {"user_id": user_id}, # Filter query for the user
+            {"$set": update_fields}, # Only update fields here
             upsert=True
         )
 
@@ -700,7 +715,6 @@ async def is_premium_user(user_id):
     try:
         user = await premium_users_collection.find_one({"user_id": user_id})
         if user and "subscription_end" in user:
-            # asyncpg returns datetime objects directly for TIMESTAMPTZ columns
             subscription_end = user["subscription_end"]
             now = datetime.now()
             return now < subscription_end
@@ -713,7 +727,6 @@ async def is_premium_user(user_id):
 async def get_premium_details(user_id):
     try:
         user = await premium_users_collection.find_one({"user_id": user_id})
-        # asyncpg returns datetime objects directly for TIMESTAMPTZ columns
         return user
     except Exception as e:
         logger.error(f"Error getting premium details for {user_id}: {e}")

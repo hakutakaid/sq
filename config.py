@@ -33,3 +33,4 @@ FREEMIUM_LIMIT = int(os.getenv("FREEMIUM_LIMIT", "0"))
 PREMIUM_LIMIT = int(os.getenv("PREMIUM_LIMIT", "50000"))
 JOIN_LINK = os.getenv("JOIN_LINK", "https://t.me/team_spy_pro") # this link for start command message
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "https://t.me/username_of_admin")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_KWycurJR4b6G@ep-falling-resonance-a1xeqesc-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
