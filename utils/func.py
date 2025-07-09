@@ -195,11 +195,31 @@ class UsersCollection:
         row = await self.db_manager._fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
         if row:
             data = dict(row)
-            data['replacement_words'] = data.get('replacement_words') or {}
-            data['delete_words'] = data.get('delete_words') or []
+            
+            # --- START FIX untuk 'str' object has no attribute 'items' ---
+            # Pastikan replacement_words adalah dictionary
+            replacement_words = data.get('replacement_words')
+            if isinstance(replacement_words, str): # Jika ternyata string
+                try:
+                    replacement_words = json.loads(replacement_words) # Coba parse sebagai JSON
+                except json.JSONDecodeError:
+                    logger.warning(f"Malformed JSON for replacement_words for user {user_id}. Resetting to empty dict.")
+                    replacement_words = {} # Reset jika gagal parse
+            data['replacement_words'] = replacement_words if isinstance(replacement_words, dict) else {} # Pastikan akhirnya dict
+
+            # Pastikan delete_words adalah list
+            delete_words = data.get('delete_words')
+            if isinstance(delete_words, str): # Jika ternyata string
+                try:
+                    delete_words = json.loads(delete_words) # Coba parse sebagai JSON
+                except json.JSONDecodeError:
+                    logger.warning(f"Malformed JSON for delete_words for user {user_id}. Resetting to empty list.")
+                    delete_words = [] # Reset jika gagal parse
+            data['delete_words'] = delete_words if isinstance(delete_words, list) else [] # Pastikan akhirnya list
+            # --- END FIX untuk 'str' object has no attribute 'items' ---
+
             return data
         return None
-
 
 class PremiumUsersCollection:
     def __init__(self, db_manager):
