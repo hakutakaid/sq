@@ -11,7 +11,7 @@ from plugins.start import subscribe as sub
 from utils.custom_filters import login_in_progress
 from utils.encrypt import dcs
 from typing import Dict, Any, Optional
-import logging # Tambahkan ini jika belum ada
+import logging
 
 # Konfigurasi logging (ini lebih baik daripada print)
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
