@@ -16,30 +16,14 @@ async def load_and_run_plugins():
     await start_client()
     
     plugin_dir = "plugins"
-    # Ensure the plugins directory exists
-    if not os.path.exists(plugin_dir):
-        print(f"Warning: Plugin directory '{plugin_dir}' not found. No plugins will be loaded.")
-        return
-
     plugins = [f[:-3] for f in os.listdir(plugin_dir) if f.endswith(".py") and f != "__init__.py"]
 
     for plugin in plugins:
-        try:
-            module = importlib.import_module(f"plugins.{plugin}")
-            # Dynamically call the plugin's run function if it exists
-            plugin_run_func_name = f"run_{plugin}_plugin"
-            if hasattr(module, plugin_run_func_name):
-                print(f"Running {plugin} plugin...")
-                plugin_func = getattr(module, plugin_run_func_name)
-                # Check if the function is a coroutine function and await it if so
-                if asyncio.iscoroutinefunction(plugin_func):
-                    await plugin_func()
-                else:
-                    plugin_func() # Call it directly if not a coroutine
-            else:
-                print(f"Warning: Plugin '{plugin}' does not have a '{plugin_run_func_name}' function.")
-        except Exception as e:
-            print(f"Error loading or running plugin '{plugin}': {e}")
+        module = importlib.import_module(f"plugins.{plugin}")
+        if hasattr(module, f"run_{plugin}_plugin"):
+            print(f"Running {plugin} plugin...")
+            await getattr(module, f"run_{plugin}_plugin")()  
+
 
 
 async def main():
