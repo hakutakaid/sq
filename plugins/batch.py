@@ -113,7 +113,8 @@ async def get_msg(c, u, i, d, lt):
                 emp[i] = getattr(xm, "empty", False)
                 if emp[i]:
                     try: await u.join_chat(i)
-                    except: pass
+                    except Exception as join_e:
+                        print(f"Could not join chat {i}: {join_e}")
                     xm = await u.get_messages((await u.get_chat(f"@{i}")).id, d)
                 return xm
             except Exception as e:
@@ -191,10 +192,10 @@ async def prog(c, t, C, h, m, st):
         bar = '🟢' * int(p / 10) + '🔴' * (10 - int(p / 10))
         speed = c / (time.time() - st) / (1024 * 1024) if time.time() > st else 0
         eta = time.strftime('%M:%S', time.gmtime((t - c) / (speed * 1024 * 1024))) if speed > 0 else '00:00'
-        try: # Tambahkan try-except untuk menghindari crash jika pesan progres tidak ditemukan/diubah
+        try:
             await C.edit_message_text(h, m, f"__**Pyro Handler...**__\n\n{bar}\n\n⚡**__Completed__**: {c_mb:.2f} MB / {t_mb:.2f} MB\n📊 **__Done__**: {p:.2f}%\n🚀 **__Speed__**: {speed:.2f} MB/s\n⏳ **__ETA__**: {eta}\n\n**__Powered by Team SPY__**")
         except MessageNotModified:
-            pass # Abaikan jika pesan tidak berubah
+            pass
         except Exception as e:
             print(f"Error editing progress message: {e}")
         if p >= 100: P.pop(m, None)
@@ -202,9 +203,8 @@ async def prog(c, t, C, h, m, st):
 async def process_msg(c, u, m, d, lt, uid, i):
     try:
         cfg_chat = await get_user_data_key(d, 'chat_id', None)
-        tcid = d # Default target chat ID is the user's chat ID
+        tcid = d
 
-        # Inisialisasi ReplyParameters, default ke membalas pesan saat ini (m.id)
         rp = ReplyParameters(message_id=m.id)
 
         if cfg_chat:
@@ -214,25 +214,23 @@ async def process_msg(c, u, m, d, lt, uid, i):
                     tcid = int(parts[0])
                     rtmid_from_cfg = int(parts[1]) if len(parts) > 1 else None
                     if rtmid_from_cfg:
-                        rp = ReplyParameters(message_id=rtmid_from_cfg) # Ganti rp jika ada ID balasan spesifik
+                        rp = ReplyParameters(message_id=rtmid_from_cfg)
                 else:
                     tcid = int(cfg_chat)
-                    # Jika hanya chat_id, tetap balas pesan saat ini di chat target
-                    rp = ReplyParameters(message_id=m.id) # Atau bisa None jika tidak ingin membalas
+                    rp = ReplyParameters(message_id=m.id)
             except ValueError:
                 print(f"Invalid chat_id format '{cfg_chat}', falling back to user chat_id.")
-                tcid = d # Fallback to user's chat if cfg_chat is invalid
-                rp = ReplyParameters(message_id=m.id) # Default ke membalas pesan saat ini
+                tcid = d
+                rp = ReplyParameters(message_id=m.id)
 
         orig_text = m.caption.markdown if m.caption else m.text.markdown if m.text else ''
         proc_text = await process_text_with_rules(d, orig_text)
         user_cap = await get_user_data_key(d, 'caption', '')
         ft = f'{proc_text}\n\n{user_cap}' if proc_text and user_cap else user_cap if user_cap else proc_text
 
-        # Coba copy_message atau forward_messages terlebih dahulu
+        # Try to copy message with reply_parameters
         if m.media or m.text:
             try:
-                # Coba salin pesan dengan caption kustom
                 copied_message = await c.copy_message(
                     chat_id=tcid,
                     from_chat_id=m.chat.id,
@@ -242,26 +240,39 @@ async def process_msg(c, u, m, d, lt, uid, i):
                 )
                 if copied_message:
                     return 'Copied.'
-            except (RPCError, FloodWait) as e:
-                print(f"Failed to copy message directly ({m.id}) due to {type(e).__name__}: {e}. Trying forwarding.")
-                if isinstance(e, FloodWait):
-                    await asyncio.sleep(e.value)
-
+            except TypeError as te: # Catch TypeError for unexpected keyword argument
+                print(f"Pyrogram version might not support 'reply_parameters' in copy_message directly. Trying without it. Error: {te}")
                 try:
-                    # Coba terusan pesan (tanpa caption kustom atau reply_parameters langsung)
-                    forwarded_message = await c.forward_messages(
+                    # Retry without reply_parameters if TypeError occurs
+                    copied_message = await c.copy_message(
                         chat_id=tcid,
                         from_chat_id=m.chat.id,
-                        message_ids=m.id,
+                        message_id=m.id,
+                        caption=ft if m.media else m.text.markdown
                     )
-                    if forwarded_message:
-                        return 'Forwarded.'
-                except (RPCError, FloodWait) as e_forward:
-                    print(f"Failed to forward message directly ({m.id}) due to {type(e_forward).__name__}: {e_forward}. Falling back to download/upload.")
-                    if isinstance(e_forward, FloodWait):
-                        await asyncio.sleep(e_forward.value)
+                    if copied_message:
+                        return 'Copied (no reply_parameters).'
+                except (RPCError, FloodWait) as e:
+                    print(f"Failed to copy message directly ({m.id}) due to {type(e).__name__}: {e}. Trying forwarding.")
+                    if isinstance(e, FloodWait): await asyncio.sleep(e.value)
+            except (RPCError, FloodWait) as e:
+                print(f"Failed to copy message directly ({m.id}) due to {type(e).__name__}: {e}. Trying forwarding.")
+                if isinstance(e, FloodWait): await asyncio.sleep(e.value)
 
-        # Fallback ke download dan upload jika copy/forward gagal
+            # Fallback to forwarding if copying fails
+            try:
+                forwarded_message = await c.forward_messages(
+                    chat_id=tcid,
+                    from_chat_id=m.chat.id,
+                    message_ids=m.id,
+                )
+                if forwarded_message:
+                    return 'Forwarded.'
+            except (RPCError, FloodWait) as e_forward:
+                print(f"Failed to forward message directly ({m.id}) due to {type(e_forward).__name__}: {e_forward}. Falling back to download/upload.")
+                if isinstance(e_forward, FloodWait): await asyncio.sleep(e_forward.value)
+
+        # Fallback to download and upload if copy/forward fails
         if m.media:
             st = time.time()
             p = await c.send_message(d, 'Downloading...')
@@ -322,23 +333,24 @@ async def process_msg(c, u, m, d, lt, uid, i):
 
                 sent = None
                 try:
+                    # Try sending with reply_parameters first
+                    send_kwargs = {'caption': ft, 'progress': prog, 'progress_args': (c, d, p.id, st), 'reply_parameters': rp}
+                    
                     if m.video or (isinstance(f, str) and os.path.splitext(f)[1].lower() in ['.mp4', '.mkv', '.avi']):
-                        sent = await Y.send_video(tcid, f, thumb=th, caption=ft,
-                                                duration=dur, height=h, width=w,
-                                                reply_parameters=rp, progress=prog, progress_args=(c, d, p.id, st))
+                        send_kwargs.update(thumb=th, duration=dur, height=h, width=w)
+                        sent = await Y.send_video(tcid, f, **send_kwargs)
                     elif m.audio:
-                        sent = await Y.send_audio(tcid, f, thumb=th, caption=ft,
-                                                duration=m.audio.duration, performer=m.audio.performer, title=m.audio.title,
-                                                reply_parameters=rp, progress=prog, progress_args=(c, d, p.id, st))
+                        send_kwargs.update(thumb=th, duration=m.audio.duration, performer=m.audio.performer, title=m.audio.title)
+                        sent = await Y.send_audio(tcid, f, **send_kwargs)
                     elif m.photo:
-                        sent = await Y.send_photo(tcid, f, caption=ft,
-                                                reply_parameters=rp, progress=prog, progress_args=(c, d, p.id, st))
+                        send_kwargs.update(thumb=th) # Photo usually doesn't need a specific thumb, but for consistency
+                        sent = await Y.send_photo(tcid, f, **send_kwargs)
                     elif m.document:
-                        sent = await Y.send_document(tcid, f, thumb=th, caption=ft,
-                                                    reply_parameters=rp, progress=prog, progress_args=(c, d, p.id, st))
+                        send_kwargs.update(thumb=th)
+                        sent = await Y.send_document(tcid, f, **send_kwargs)
                     else:
-                        sent = await Y.send_document(tcid, f, thumb=th, caption=ft,
-                                                    reply_parameters=rp, progress=prog, progress_args=(c, d, p.id, st))
+                        send_kwargs.update(thumb=th)
+                        sent = await Y.send_document(tcid, f, **send_kwargs)
 
                     if sent:
                         if th and os.path.exists(th) and th != f'{d}.jpg':
@@ -349,6 +361,38 @@ async def process_msg(c, u, m, d, lt, uid, i):
                     else:
                         raise Exception("Failed to send large file via userbot.")
 
+                except TypeError as te: # Catch TypeError for unexpected keyword argument (e.g., reply_parameters)
+                    print(f"Pyrogram version might not support 'reply_parameters' in send_media. Retrying without it. Error: {te}")
+                    try:
+                        # Retry without reply_parameters
+                        send_kwargs.pop('reply_parameters', None) # Remove it safely
+                        if m.video or (isinstance(f, str) and os.path.splitext(f)[1].lower() in ['.mp4', '.mkv', '.avi']):
+                            sent = await Y.send_video(tcid, f, **send_kwargs)
+                        elif m.audio:
+                            sent = await Y.send_audio(tcid, f, **send_kwargs)
+                        elif m.photo:
+                            sent = await Y.send_photo(tcid, f, **send_kwargs)
+                        elif m.document:
+                            sent = await Y.send_document(tcid, f, **send_kwargs)
+                        else:
+                            sent = await Y.send_document(tcid, f, **send_kwargs)
+
+                        if sent:
+                            if th and os.path.exists(th) and th != f'{d}.jpg':
+                                os.remove(th)
+                            os.remove(f)
+                            await c.delete_messages(d, p.id)
+                            return 'Done (Large file via userbot, no reply_parameters).'
+                        else:
+                            raise Exception("Failed to send large file via userbot after retry.")
+
+                    except Exception as upload_e:
+                        print(f"Large file upload failed for {f} after retry: {upload_e}")
+                        await c.edit_message_text(d, p.id, f'Large file upload failed: {str(upload_e)[:50]}')
+                        if th and os.path.exists(th) and th != f'{d}.jpg':
+                            os.remove(th)
+                        if os.path.exists(f): os.remove(f)
+                        return 'Large file upload failed.'
                 except Exception as upload_e:
                     print(f"Large file upload failed for {f}: {upload_e}")
                     await c.edit_message_text(d, p.id, f'Large file upload failed: {str(upload_e)[:50]}')
@@ -361,37 +405,70 @@ async def process_msg(c, u, m, d, lt, uid, i):
             st = time.time()
 
             try:
+                # Try sending with reply_parameters first
+                send_kwargs = {'caption': ft, 'progress': prog, 'progress_args': (c, d, p.id, st), 'reply_parameters': rp}
+
                 if m.video or (isinstance(f, str) and os.path.splitext(f)[1].lower() in ['.mp4', '.mkv', '.avi']):
                     mtd = await get_video_metadata(f)
                     dur, h, w = mtd.get('duration'), mtd.get('height'), mtd.get('width')
                     th_for_upload = await screenshot(f, dur or 1, d) if not th else th
-                    await c.send_video(tcid, video=f, caption=ft,
-                                    thumb=th_for_upload, width=w, height=h, duration=dur,
-                                    progress=prog, progress_args=(c, d, p.id, st),
-                                    reply_parameters=rp)
+                    send_kwargs.update(thumb=th_for_upload, width=w, height=h, duration=dur)
+                    await c.send_video(tcid, video=f, **send_kwargs)
                 elif m.video_note:
-                    await c.send_video_note(tcid, video_note=f, progress=prog,
-                                        progress_args=(c, d, p.id, st), reply_parameters=rp)
+                    await c.send_video_note(tcid, video_note=f, **send_kwargs)
                 elif m.voice:
-                    await c.send_voice(tcid, f, progress=prog, progress_args=(c, d, p.id, st),
-                                    reply_parameters=rp)
+                    await c.send_voice(tcid, f, **send_kwargs)
                 elif m.sticker:
-                    await c.send_sticker(tcid, m.sticker.file_id, reply_parameters=rp)
+                    await c.send_sticker(tcid, m.sticker.file_id, reply_parameters=rp) # Stickers might be handled differently
                 elif m.audio:
                     th_for_upload = th
-                    await c.send_audio(tcid, audio=f, caption=ft,
-                                    thumb=th_for_upload, progress=prog, progress_args=(c, d, p.id, st),
-                                    reply_parameters=rp)
+                    send_kwargs.update(thumb=th_for_upload)
+                    await c.send_audio(tcid, audio=f, **send_kwargs)
                 elif m.photo:
                     th_for_upload = th
-                    await c.send_photo(tcid, photo=f, caption=ft,
-                                    progress=prog, progress_args=(c, d, p.id, st),
-                                    reply_parameters=rp)
+                    send_kwargs.update(thumb=th_for_upload)
+                    await c.send_photo(tcid, photo=f, **send_kwargs)
                 else:
                     th_for_upload = th
-                    await c.send_document(tcid, document=f, caption=ft,
-                                        progress=prog, progress_args=(c, d, p.id, st),
-                                        reply_parameters=rp)
+                    send_kwargs.update(thumb=th_for_upload)
+                    await c.send_document(tcid, document=f, **send_kwargs)
+
+            except TypeError as te: # Catch TypeError for unexpected keyword argument (e.g., reply_parameters)
+                print(f"Pyrogram version might not support 'reply_parameters' in send_media. Retrying without it. Error: {te}")
+                try:
+                    # Retry without reply_parameters
+                    send_kwargs.pop('reply_parameters', None)
+                    if m.video or (isinstance(f, str) and os.path.splitext(f)[1].lower() in ['.mp4', '.mkv', '.avi']):
+                        mtd = await get_video_metadata(f)
+                        dur, h, w = mtd.get('duration'), mtd.get('height'), mtd.get('width')
+                        th_for_upload = await screenshot(f, dur or 1, d) if not th else th
+                        send_kwargs.update(thumb=th_for_upload, width=w, height=h, duration=dur)
+                        await c.send_video(tcid, video=f, **send_kwargs)
+                    elif m.video_note:
+                        await c.send_video_note(tcid, video_note=f, **send_kwargs)
+                    elif m.voice:
+                        await c.send_voice(tcid, f, **send_kwargs)
+                    elif m.sticker:
+                        await c.send_sticker(tcid, m.sticker.file_id) # Stickers might be handled differently without RP
+                    elif m.audio:
+                        th_for_upload = th
+                        send_kwargs.update(thumb=th_for_upload)
+                        await c.send_audio(tcid, audio=f, **send_kwargs)
+                    elif m.photo:
+                        th_for_upload = th
+                        send_kwargs.update(thumb=th_for_upload)
+                        await c.send_photo(tcid, photo=f, **send_kwargs)
+                    else:
+                        th_for_upload = th
+                        send_kwargs.update(thumb=th_for_upload)
+                        await c.send_document(tcid, document=f, **send_kwargs)
+
+                except Exception as e:
+                    await c.edit_message_text(d, p.id, f'Upload failed: {str(e)[:50]}')
+                    if th and os.path.exists(th) and th != f'{d}.jpg':
+                        os.remove(th)
+                    if os.path.exists(f): os.remove(f)
+                    return 'Failed.'
             except Exception as e:
                 await c.edit_message_text(d, p.id, f'Upload failed: {str(e)[:50]}')
                 if th and os.path.exists(th) and th != f'{d}.jpg':
@@ -407,8 +484,16 @@ async def process_msg(c, u, m, d, lt, uid, i):
             return 'Done (Download & Upload).'
 
         elif m.text:
-            await c.send_message(tcid, text=ft, reply_parameters=rp)
-            return 'Sent.'
+            try:
+                await c.send_message(tcid, text=ft, reply_parameters=rp)
+                return 'Sent.'
+            except TypeError as te: # Catch TypeError for unexpected keyword argument
+                print(f"Pyrogram version might not support 'reply_parameters' in send_message. Retrying without it. Error: {te}")
+                await c.send_message(tcid, text=ft)
+                return 'Sent (no reply_parameters).'
+            except Exception as e:
+                print(f"Error sending text message: {e}")
+                return f'Failed to send text: {str(e)[:50]}'
         else:
             return 'Unsupported message type.'
     except Exception as e:
@@ -498,7 +583,6 @@ async def text_handler(c, m):
             Z.pop(uid, None)
             return
 
-        # --- Bagian Kritis untuk Progres Single ---
         await add_active_batch(uid, {
             "total": 1,
             "current": 0,
@@ -507,13 +591,12 @@ async def text_handler(c, m):
             "progress_message_id": pt.id,
             "chat_id": m.chat.id
         })
-        # --- Akhir Bagian Kritis ---
 
         try:
             msg = await get_msg(ubot, uc, channel_id, message_id, link_type)
             if msg:
                 res = await process_msg(ubot, uc, msg, str(m.chat.id), link_type, uid, channel_id)
-                await update_batch_progress(uid, 1, (1 if 'Done' in res or 'Copied' in res or 'Sent' in res or 'Forwarded' in res else 0))
+                await update_batch_progress(uid, 1, (1 if any(s in res for s in ['Done', 'Copied', 'Sent', 'Forwarded']) else 0))
                 await pt.edit(f'1/1: {res}')
             else:
                 await pt.edit('Message not found')
@@ -555,7 +638,6 @@ async def text_handler(c, m):
             Z.pop(uid, None)
             return
 
-        # --- Bagian Kritis untuk Progres Batch ---
         await add_active_batch(uid, {
             "total": total_messages,
             "current": 0,
@@ -564,14 +646,13 @@ async def text_handler(c, m):
             "progress_message_id": pt.id,
             "chat_id": m.chat.id
             })
-        # --- Akhir Bagian Kritis ---
 
         try:
             for j in range(total_messages):
                 current_message_index = j + 1
 
                 if should_cancel(uid):
-                    await pt.edit(f'Cancelled at {j}/{total_messages}. Success: {success}')
+                    await pt.edit(f'Cancellation requested. Stopping batch after current message. Success: {success}/{current_message_index-1}')
                     break
 
                 await update_batch_progress(uid, current_message_index - 1, success)
@@ -582,23 +663,39 @@ async def text_handler(c, m):
                     msg = await get_msg(ubot, uc, i, mid, lt)
                     if msg:
                         res = await process_msg(ubot, uc, msg, str(m.chat.id), lt, uid, i)
-                        if 'Done' in res or 'Copied' in res or 'Sent' in res or 'Forwarded' in res:
+                        if any(s_res in res for s_res in ['Done', 'Copied', 'Sent', 'Forwarded']):
                             success += 1
                         else:
                             print(f"Message {mid} processing failed with result: {res}")
                     else:
                         print(f"Message {mid} not found or inaccessible for user {uid}.")
+                except FloodWait as fw:
+                    print(f"FloodWait encountered. Sleeping for {fw.value} seconds.")
+                    await pt.edit(f"FloodWait encountered. Sleeping for {fw.value} seconds before continuing.")
+                    await asyncio.sleep(fw.value)
+                    # Try processing the same message again after FloodWait
+                    msg = await get_msg(ubot, uc, i, mid, lt)
+                    if msg:
+                        res = await process_msg(ubot, uc, msg, str(m.chat.id), lt, uid, i)
+                        if any(s_res in res for s_res in ['Done', 'Copied', 'Sent', 'Forwarded']):
+                            success += 1
+                        else:
+                            print(f"Message {mid} processing failed with result after FloodWait: {res}")
+                    else:
+                        print(f"Message {mid} still not found or inaccessible after FloodWait.")
                 except Exception as e:
                     print(f"Error processing message {mid} for user {uid}: {e}")
                     try: await pt.edit(f'{current_message_index}/{total_messages}: Error - {str(e)[:30]}')
                     except MessageNotModified: pass
                     except Exception as ex: print(f"Error editing error message: {ex}")
 
-                await asyncio.sleep(5)
+                # Small delay between messages to prevent hitting rate limits
+                await asyncio.sleep(2) # Reduced from 5 to 2 for potentially faster processing, adjust as needed
 
             await update_batch_progress(uid, total_messages, success)
 
-            await m.reply_text(f'Batch Completed ✅ Success: {success}/{total_messages}')
+            if not should_cancel(uid): # Only send final message if not cancelled mid-way
+                await m.reply_text(f'Batch Completed ✅ Success: {success}/{total_messages}')
 
         except Exception as e:
             print(f"Unhandled error in batch processing for user {uid}: {e}")
